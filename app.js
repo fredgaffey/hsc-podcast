@@ -1102,7 +1102,10 @@
 
   // --- Controls ---
   const togglePlay = () => {
-    if (!currentEpisode) return;
+    // The Past the Shallows plot map loads audio directly (no loadEpisode, so no
+    // currentEpisode). Still allow play/pause whenever a source is actually loaded,
+    // matching the media-session and spacebar handlers which never gated on episode.
+    if (!currentEpisode && !audio.currentSrc) return;
     if (audio.paused) { alog("btn:play"); resumeAudioGraph(); audio.play().then(() => alog("btn:play resolved")).catch((e) => alog("btn:play REJECTED", "reason=" + (e && e.name))); }
     else { alog("btn:pause"); audio.pause(); }
   };
