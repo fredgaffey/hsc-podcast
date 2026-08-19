@@ -613,14 +613,19 @@
     root.innerHTML =
       '<div class="pm-wrap">' +
         '<div class="pm-source">' +
-          '<button class="pm-pick" id="pm-pick">Choose your audiobook file</button>' +
-          '<button class="pm-pick pm-pick-alt" id="pm-unlock" hidden>Sign in to play</button>' +
-          '<button class="pm-pick pm-pick-alt" id="pm-download" hidden>Save offline</button>' +
-          '<button class="pm-pick pm-pick-alt" id="pm-read" hidden>Read along (my PDF)</button>' +
-          '<input type="file" id="pm-file" accept="audio/*,.m4b,.m4a,.mp3" hidden>' +
-          '<div class="pm-pinbox" id="pm-pinbox" hidden></div>' +
-          '<div class="pm-source-msg" id="pm-source-msg">Past the Shallows is in copyright, so no recording ships with this app. ' +
-            'Load your own file — it stays on this device and is never uploaded.</div>' +
+          '<div class="pm-source-row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
+            '<button class="pm-pick pm-pick-alt" id="pm-read" hidden>Read along (my PDF)</button>' +
+            '<button class="pm-pick pm-pick-alt" id="pm-setup-toggle" aria-expanded="false">Audio setup ▾</button>' +
+          '</div>' +
+          '<div class="pm-setup" id="pm-setup" hidden>' +
+            '<button class="pm-pick" id="pm-pick">Choose your audiobook file</button>' +
+            '<button class="pm-pick pm-pick-alt" id="pm-unlock" hidden>Sign in to play</button>' +
+            '<button class="pm-pick pm-pick-alt" id="pm-download" hidden>Save offline</button>' +
+            '<input type="file" id="pm-file" accept="audio/*,.m4b,.m4a,.mp3" hidden>' +
+            '<div class="pm-pinbox" id="pm-pinbox" hidden></div>' +
+            '<div class="pm-source-msg" id="pm-source-msg">Past the Shallows is in copyright, so no recording ships with this app. ' +
+              'Load your own file — it stays on this device and is never uploaded.</div>' +
+          '</div>' +
         "</div>" +
         '<div class="pm-status" id="pm-status"></div>' +
         '<div class="pm-svgwrap" id="pm-svgwrap"></div>' +
@@ -655,6 +660,20 @@
     document.getElementById("pm-file").addEventListener("change", function (e) {
       useFile(e.target.files && e.target.files[0]);
     });
+    // Collapse the setup controls (file / sign-in / offline) — they eat space, and are
+    // rarely needed once signed in. Start collapsed for a signed-in device, open otherwise.
+    var pmSetup = document.getElementById("pm-setup");
+    var pmSetupToggle = document.getElementById("pm-setup-toggle");
+    if (pmSetup) pmSetup.hidden = !!storedToken();
+    if (pmSetupToggle) {
+      pmSetupToggle.setAttribute("aria-expanded", pmSetup && !pmSetup.hidden ? "true" : "false");
+      pmSetupToggle.addEventListener("click", function () {
+        if (!pmSetup) return;
+        pmSetup.hidden = !pmSetup.hidden;
+        pmSetupToggle.setAttribute("aria-expanded", pmSetup.hidden ? "false" : "true");
+        pmSetupToggle.textContent = pmSetup.hidden ? "Audio setup ▾" : "Audio setup ▴";
+      });
+    }
     svgWrap.addEventListener("click", function (e) {
       var g = e.target.closest && e.target.closest("[data-scene]");
       if (g) select(g.getAttribute("data-scene"), true);
