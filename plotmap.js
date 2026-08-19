@@ -24,6 +24,9 @@
 
   var scenes = [], quotes = [], activeId = null, audio = null, loaded = false;
   var root, svgWrap, detailEl, statusEl, placeholderUrl = null, priv = null;
+  // Read-along reader state (renders the user's own private PDF via pdf.js).
+  var pdfDoc = null, pdfPages = [], pdfNumPages = 0, readerOpen = false,
+      followAudio = true, userScrolledAt = 0, lastSyncPage = 0;
 
   /* ---------- tiny IndexedDB store for the listener's own audio file ---------- */
   var DB = "pts-audio", STORE = "files";
@@ -228,6 +231,7 @@
     if (statusEl) {
       statusEl.textContent = sc ? "Now: " + sc.order + ". " + sc.title + "  (" + p.toFixed(1) + "% through)" : "";
     }
+    if (readerOpen) syncReaderToPct(p, false);
   }
 
   /* ---------- audio source ---------- */
@@ -461,6 +465,130 @@
   /* ---------- public ---------- */
   // cfg is the subject manifest entry; we read audioBaseUrl + setTexts[..].placeholderAudio
   // from it so the R2 location lives in subject.json, not hard-coded here.
+  /* ---------- read-along reader (renders the user's OWN private PDF) ----------
+     The novel text never ships with the app and is never public. The PDF lives in
+     the same private, sign-in-gated R2 bucket as the audio; pdf.js streams it with
+     Range requests using the account token. Pages auto-follow the audio position via
+     the existing scene->pdfPage anchors, so a highlight box moves as you listen. */
+  function setReadMsg(m) { var el = document.getElementById("pm-read-msg"); if (el) el.textContent = m || ""; }
+
+  function loadPdfJs() {
+    if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+    return new Promise(function (res, rej) {
+      var s = document.createElement("script");
+      s.src = "vendor/pdf.min.js";
+      s.onload = function () {
+        try { window.pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js"; } catch (e) {}
+        res(window.pdfjsLib);
+      };
+      s.onerror = function () { rej(new Error("reader failed to load")); };
+      document.head.appendChild(s);
+    });
+  }
+
+  // The PDF sits beside the audio key in the private bucket (book.m4a -> book.pdf).
+  function pdfUrl(token) {
+    var keyPdf = (priv.key || "").replace(/\.[^.]+$/, ".pdf");
+    return priv.worker.replace(/\/+$/, "") + "/" + keyPdf.replace(/^\/+/, "") +
+           "?t=" + encodeURIComponent(token);
+  }
+
+  function openReader() {
+    var tok = storedToken();
+    if (!tok) { showSignIn(); setStatus("Sign in to read your PDF.", ""); return; }
+    var reader = document.getElementById("pm-reader");
+    if (readerOpen) { reader.hidden = !reader.hidden; return; }
+    reader.hidden = false;
+    setReadMsg("Loading your PDF…");
+    var follow = document.getElementById("pm-follow");
+    if (follow) follow.addEventListener("change", function () { followAudio = follow.checked; });
+    loadPdfJs().then(function (pdfjsLib) {
+      return pdfjsLib.getDocument({ url: pdfUrl(tok), rangeChunkSize: 262144 }).promise;
+    }).then(function (doc) {
+      pdfDoc = doc; pdfNumPages = doc.numPages; readerOpen = true;
+      return buildPages();
+    }).then(function () {
+      setReadMsg("");
+      var p = pctNow(); if (p != null) syncReaderToPct(p, true);
+    }).catch(function (e) {
+      setReadMsg("Couldn't open the PDF: " + (e && e.message || e));
+    });
+  }
+
+  function buildPages() {
+    var host = document.getElementById("pm-pages");
+    host.innerHTML = ""; pdfPages = [];
+    host.style.maxHeight = "72vh"; host.style.overflowY = "auto";
+    host.addEventListener("scroll", function () { userScrolledAt = Date.now(); });
+    return pdfDoc.getPage(1).then(function (pg) {
+      var vp = pg.getViewport({ scale: 1 });
+      var ratio = vp.height / vp.width;
+      for (var i = 1; i <= pdfNumPages; i++) {
+        var d = document.createElement("div");
+        d.className = "pm-page"; d.setAttribute("data-page", i);
+        d.style.position = "relative"; d.style.margin = "0 auto 10px";
+        d.style.width = "100%"; d.style.paddingBottom = (ratio * 100) + "%";
+        d.style.background = "rgba(127,127,127,0.08)";
+        host.appendChild(d);
+        pdfPages.push({ el: d, rendered: false, rendering: false });
+      }
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) { if (en.isIntersecting) renderPage(parseInt(en.target.getAttribute("data-page"), 10)); });
+      }, { root: host, rootMargin: "800px 0px" });
+      pdfPages.forEach(function (p) { io.observe(p.el); });
+    });
+  }
+
+  function renderPage(num) {
+    var slot = pdfPages[num - 1];
+    if (!slot || slot.rendered || slot.rendering) return;
+    slot.rendering = true;
+    pdfDoc.getPage(num).then(function (pg) {
+      var host = slot.el;
+      var cssW = host.clientWidth || 600;
+      var vp1 = pg.getViewport({ scale: 1 });
+      var dpr = window.devicePixelRatio || 1;
+      var vp = pg.getViewport({ scale: (cssW / vp1.width) * dpr });
+      var canvas = document.createElement("canvas");
+      canvas.width = vp.width; canvas.height = vp.height;
+      canvas.style.width = "100%"; canvas.style.height = "auto"; canvas.style.display = "block";
+      host.style.paddingBottom = ""; host.style.background = ""; host.innerHTML = "";
+      host.appendChild(canvas);
+      return pg.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+    }).then(function () { slot.rendered = true; slot.rendering = false; })
+      .catch(function () { slot.rendering = false; });
+  }
+
+  // Map percentage-through-the-book to a PDF page using the scene anchors, matching
+  // the same pctNow() model the plot arc already uses.
+  function pageForPct(p) {
+    var sc = sceneAtPct(p);
+    if (sc && sc.pdfPageStart) {
+      var span = (sc.endPct - sc.startPct) || 1;
+      var frac = Math.max(0, Math.min(1, (p - sc.startPct) / span));
+      var pEnd = sc.pdfPageEnd || sc.pdfPageStart;
+      return Math.round(sc.pdfPageStart + frac * (pEnd - sc.pdfPageStart));
+    }
+    return Math.max(1, Math.min(pdfNumPages, Math.round((p / 100) * pdfNumPages)));
+  }
+
+  function syncReaderToPct(p, force) {
+    if (!readerOpen) return;
+    if (!force && !followAudio) return;
+    if (!force && Date.now() - userScrolledAt < 4000) return; // don't yank the page while reading
+    var num = Math.max(1, Math.min(pdfNumPages, pageForPct(p)));
+    if (num === lastSyncPage && !force) return;
+    lastSyncPage = num;
+    var slot = pdfPages[num - 1];
+    if (!slot) return;
+    pdfPages.forEach(function (pp) { pp.el.style.boxShadow = ""; });
+    slot.el.style.boxShadow = "0 0 0 3px #4a9eff";   // the box that moves as you listen
+    renderPage(num);
+    if (num > 1) renderPage(num - 1);
+    if (num < pdfNumPages) renderPage(num + 1);
+    slot.el.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+
   function render(container, audioEl, cfg) {
     root = container; audio = audioEl;
     placeholderUrl = null;
@@ -481,6 +609,7 @@
           '<button class="pm-pick" id="pm-pick">Choose your audiobook file</button>' +
           '<button class="pm-pick pm-pick-alt" id="pm-unlock" hidden>Sign in to play</button>' +
           '<button class="pm-pick pm-pick-alt" id="pm-download" hidden>Save offline</button>' +
+          '<button class="pm-pick pm-pick-alt" id="pm-read" hidden>Read along (my PDF)</button>' +
           '<input type="file" id="pm-file" accept="audio/*,.m4b,.m4a,.mp3" hidden>' +
           '<div class="pm-pinbox" id="pm-pinbox" hidden></div>' +
           '<div class="pm-source-msg" id="pm-source-msg">Past the Shallows is in copyright, so no recording ships with this app. ' +
@@ -489,6 +618,13 @@
         '<div class="pm-status" id="pm-status"></div>' +
         '<div class="pm-svgwrap" id="pm-svgwrap"></div>' +
         '<div class="pm-detail" id="pm-detail"></div>' +
+        '<div class="pm-reader" id="pm-reader" hidden>' +
+          '<div class="pm-reader-head">' +
+            '<label class="pm-follow"><input type="checkbox" id="pm-follow" checked> Follow audio</label>' +
+            '<span class="pm-read-msg" id="pm-read-msg"></span>' +
+          '</div>' +
+          '<div class="pm-pages" id="pm-pages"></div>' +
+        '</div>' +
       "</div>";
     svgWrap = document.getElementById("pm-svgwrap");
     detailEl = document.getElementById("pm-detail");
@@ -501,6 +637,9 @@
       var db = document.getElementById("pm-download");
       db.hidden = false;
       db.addEventListener("click", function () { downloadOffline(); });
+      var rb = document.getElementById("pm-read");
+      rb.hidden = false;
+      rb.addEventListener("click", function () { openReader(); });
     }
     document.getElementById("pm-pick").addEventListener("click", function () {
       document.getElementById("pm-file").click();
