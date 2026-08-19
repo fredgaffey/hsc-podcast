@@ -586,7 +586,12 @@
     renderPage(num);
     if (num > 1) renderPage(num - 1);
     if (num < pdfNumPages) renderPage(num + 1);
-    slot.el.scrollIntoView({ block: "start", behavior: "smooth" });
+    // Scroll the reader pane itself (scrollIntoView picks the wrong ancestor here).
+    var host = document.getElementById("pm-pages");
+    if (host) {
+      var top = slot.el.getBoundingClientRect().top - host.getBoundingClientRect().top + host.scrollTop;
+      host.scrollTo({ top: Math.max(0, top - 6), behavior: "smooth" });
+    }
   }
 
   function render(container, audioEl, cfg) {
