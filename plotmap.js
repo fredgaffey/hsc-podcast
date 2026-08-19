@@ -579,6 +579,8 @@
     var num = Math.max(1, Math.min(pdfNumPages, pageForPct(p)));
     if (num === lastSyncPage && !force) return;
     lastSyncPage = num;
+    var pn = document.getElementById("pm-pagenum");
+    if (pn) pn.textContent = "Page " + num + " of " + pdfNumPages;
     var slot = pdfPages[num - 1];
     if (!slot) return;
     pdfPages.forEach(function (pp) { pp.el.style.boxShadow = ""; });
@@ -590,7 +592,7 @@
     var host = document.getElementById("pm-pages");
     if (host) {
       var top = slot.el.getBoundingClientRect().top - host.getBoundingClientRect().top + host.scrollTop;
-      host.scrollTo({ top: Math.max(0, top - 6), behavior: "smooth" });
+      host.scrollTo({ top: Math.max(0, top - 6), behavior: "auto" });
     }
   }
 
@@ -626,6 +628,7 @@
         '<div class="pm-reader" id="pm-reader" hidden>' +
           '<div class="pm-reader-head">' +
             '<label class="pm-follow"><input type="checkbox" id="pm-follow" checked> Follow audio</label>' +
+            '<span class="pm-pagenum" id="pm-pagenum" style="font-weight:600;padding:2px 8px;border:1px solid currentColor;border-radius:6px"></span>' +
             '<span class="pm-read-msg" id="pm-read-msg"></span>' +
           '</div>' +
           '<div class="pm-pages" id="pm-pages"></div>' +
