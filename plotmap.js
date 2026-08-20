@@ -663,42 +663,68 @@
   // copy of the novel (never produced by the app). Reads book.md from the same private,
   // sign-in-gated bucket; highlights and slides through the current paragraph as the
   // audio plays, mapping position by word-fraction the same way the plot arc uses pct.
-  function bookUrl(token) {
-    var key = (priv.key || "").replace(/\.[^.]+$/, ".md");
-    return priv.worker.replace(/\/+$/, "") + "/" + key.replace(/^\/+/, "") + "?t=" + encodeURIComponent(token);
-  }
-
   function openBookText() {
     if (bookLoaded) return;
     var host = document.getElementById("pm-bookreader");
     if (!host) return;
     var tok = storedToken();
-    if (!tok) { host.innerHTML = '<p class="pm-hint">Sign in (Audio setup) to load your book text.</p>'; return; }
-    host.innerHTML = '<p class="pm-hint">Loading your book text…</p>';
-    fetch(bookUrl(tok)).then(function (r) {
-      if (r.status === 404) throw new Error("nofile");
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.text();
-    }).then(function (txt) {
-      renderBookText(host, txt);
+    if (!tok) { host.innerHTML = '<p class="pm-hint">Sign in (Audio setup) to read your book.</p>'; return; }
+    host.innerHTML = '<p class="pm-hint">Preparing your book text…</p>';
+    loadPdfJs().then(function (pdfjsLib) {
+      if (pdfDoc) return pdfDoc;
+      return pdfjsLib.getDocument({ url: pdfUrl(tok) }).promise.then(function (d) {
+        pdfDoc = d; pdfNumPages = d.numPages; return d;
+      });
+    }).then(function (doc) {
+      return extractParagraphs(doc);
+    }).then(function (paras) {
+      renderBookParas(host, paras);
       bookLoaded = true;
       var p = pctNow(); if (p != null) syncBookToPct(p);
     }).catch(function (e) {
-      if (e && e.message === "nofile") {
-        host.innerHTML = '<div class="pm-hint" style="line-height:1.6">' +
-          '<strong>Book text not added yet.</strong><br>' +
-          'This view reads a verbatim text file of the novel from your own copy. Add a ' +
-          '<code>book.md</code> (plain paragraphs separated by blank lines) to your private ' +
-          'bucket and it appears here, with a highlight that tracks the audio paragraph by paragraph.</div>';
-      } else {
-        host.innerHTML = '<p class="pm-err">Could not load book text: ' + esc(e && e.message) + "</p>";
-      }
+      host.innerHTML = '<p class="pm-err">Could not read the book text: ' + esc(e && e.message) + "</p>";
     });
   }
 
-  function renderBookText(host, txt) {
+  // Pull the verbatim text straight out of the user's OWN PDF, in their browser — nothing
+  // is generated or stored by the app. Group text items into lines by vertical position,
+  // then start a new paragraph on an indented line (how novels mark paragraphs).
+  function extractParagraphs(doc) {
+    var paras = [], cur = "";
+    function flush() { var t = cur.trim(); if (t) paras.push(t); cur = ""; }
+    var chain = Promise.resolve();
+    for (var n = 1; n <= doc.numPages; n++) {
+      (function (pageNum) {
+        chain = chain.then(function () {
+          return doc.getPage(pageNum).then(function (page) {
+            return page.getTextContent().then(function (tc) {
+              var items = tc.items.filter(function (it) { return it.str && it.str.trim(); });
+              if (!items.length) return;
+              var leftMargin = Infinity;
+              items.forEach(function (it) { leftMargin = Math.min(leftMargin, it.transform[4]); });
+              var lines = [], lastY = null, line = null;
+              items.forEach(function (it) {
+                var y = it.transform[5], x = it.transform[4];
+                if (lastY === null || Math.abs(y - lastY) > 3) { line = { x: x, text: "" }; lines.push(line); }
+                line.text += it.str;
+                lastY = y;
+              });
+              lines.forEach(function (ln) {
+                var text = ln.text.replace(/\s+/g, " ").trim();
+                if (!text || /^\d{1,4}$/.test(text)) return; // drop bare page numbers
+                if (ln.x > leftMargin + 8) { flush(); cur = text; }   // indent => new paragraph
+                else { cur += (cur ? " " : "") + text; }
+              });
+            });
+          });
+        });
+      })(n);
+    }
+    return chain.then(function () { flush(); return paras; });
+  }
+
+  function renderBookParas(host, paras) {
     host.addEventListener("scroll", function () { userScrolledAt = Date.now(); });
-    var paras = txt.replace(/\r/g, "").split(/\n\s*\n/).map(function (s) { return s.trim(); }).filter(Boolean);
     bookParas = []; bookTotalWords = 0;
     var html = "";
     paras.forEach(function (para, i) {
