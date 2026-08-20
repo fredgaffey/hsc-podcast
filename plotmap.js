@@ -27,6 +27,7 @@
   // Read-along reader state (renders the user's own private PDF via pdf.js).
   var pdfDoc = null, pdfPages = [], pdfNumPages = 0, readerOpen = false,
       followAudio = true, userScrolledAt = 0, lastSyncPage = 0;
+  var currentTab = "map", readMode = "pdf", textBuilt = false, allQuotesBuilt = false;
 
   /* ---------- tiny IndexedDB store for the listener's own audio file ---------- */
   var DB = "pts-audio", STORE = "files";
@@ -231,7 +232,10 @@
     if (statusEl) {
       statusEl.textContent = sc ? "Now: " + sc.order + ". " + sc.title + "  (" + p.toFixed(1) + "% through)" : "";
     }
-    if (readerOpen) syncReaderToPct(p, false);
+    if (currentTab === "read") {
+      if (readMode === "text") syncTextToPct(p);
+      else if (readerOpen) syncReaderToPct(p, false);
+    }
   }
 
   /* ---------- audio source ---------- */
@@ -494,11 +498,14 @@
   }
 
   function openReader() {
+    if (readerOpen) return; // PDF already loaded; visibility handled by showReadMode
     var tok = storedToken();
-    if (!tok) { showSignIn(); setStatus("Sign in to read your PDF.", ""); return; }
-    var reader = document.getElementById("pm-reader");
-    if (readerOpen) { reader.hidden = !reader.hidden; return; }
-    reader.hidden = false;
+    if (!tok) {
+      var setup = document.getElementById("pm-setup"); if (setup) setup.hidden = false;
+      showSignIn();
+      setReadMsg("Sign in above to load your book.");
+      return;
+    }
     setReadMsg("Loading your PDF…");
     var follow = document.getElementById("pm-follow");
     if (follow) follow.addEventListener("change", function () { followAudio = follow.checked; });
@@ -596,6 +603,114 @@
     }
   }
 
+  function injectReaderStyles() {
+    if (document.getElementById("pm-reader-styles")) return;
+    var s = document.createElement("style");
+    s.id = "pm-reader-styles";
+    s.textContent =
+      ".pm-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}" +
+      ".pm-readmodes{display:flex;gap:6px;margin:0 0 10px}" +
+      ".pm-tab{padding:8px 14px;border-radius:10px;border:1px solid rgba(127,127,127,.3);" +
+        "background:var(--bg-card);color:inherit;font-weight:600;cursor:pointer;font-size:.95rem}" +
+      ".pm-tab-active{background:var(--accent,#4a9eff);color:#fff;border-color:transparent}" +
+      ".pm-pages{max-height:72vh;overflow-y:auto}" +
+      ".pm-reader-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}" +
+      ".pm-pagenum{font-weight:600;padding:2px 8px;border:1px solid currentColor;border-radius:6px}" +
+      ".pm-textreader{max-height:72vh;overflow-y:auto}" +
+      ".pm-tblock{padding:12px 14px;margin:0 0 10px;border-radius:12px;background:var(--bg-card)}" +
+      ".pm-tblock-current{box-shadow:0 0 0 3px var(--accent,#4a9eff)}" +
+      ".pm-tblock h4{margin:0 0 6px}" +
+      ".pm-tblock blockquote{margin:8px 0 0;padding-left:10px;border-left:3px solid var(--accent,#4a9eff)}" +
+      ".pm-aq{padding:12px 14px;margin:0 0 10px;border-radius:12px;background:var(--bg-card)}" +
+      ".pm-aq blockquote{margin:0 0 6px}" +
+      ".pm-aq-meta{font-size:.85rem;opacity:.7}";
+    document.head.appendChild(s);
+  }
+
+  function showTab(name) {
+    currentTab = name;
+    root.querySelectorAll(".pm-panel").forEach(function (p) { p.hidden = p.getAttribute("data-panel") !== name; });
+    root.querySelectorAll(".pm-tab[data-tab]").forEach(function (t) {
+      t.classList.toggle("pm-tab-active", t.getAttribute("data-tab") === name);
+    });
+    if (name === "read") showReadMode(readMode);
+    if (name === "quotes") renderAllQuotes();
+  }
+
+  function showReadMode(mode) {
+    readMode = mode;
+    var pdfPanel = document.getElementById("pm-reader");
+    var textPanel = document.getElementById("pm-textreader");
+    var mpdf = document.getElementById("pm-mode-pdf"), mtext = document.getElementById("pm-mode-text");
+    if (mpdf) mpdf.classList.toggle("pm-tab-active", mode === "pdf");
+    if (mtext) mtext.classList.toggle("pm-tab-active", mode === "text");
+    if (pdfPanel) pdfPanel.hidden = mode !== "pdf";
+    if (textPanel) textPanel.hidden = mode !== "text";
+    if (mode === "pdf") openReader();
+    else { renderTextReader(); var p = pctNow(); if (p != null) syncTextToPct(p); }
+  }
+
+  // Text mode: a reflowable, scrolling companion built from the app's OWN scene
+  // summaries and pinned quotes (never the novel text), following the audio.
+  function renderTextReader() {
+    var host = document.getElementById("pm-textreader");
+    if (!host || textBuilt) return;
+    if (!scenes.length) { host.innerHTML = '<p class="pm-hint">Loading…</p>'; return; }
+    host.addEventListener("scroll", function () { userScrolledAt = Date.now(); });
+    host.innerHTML = scenes.map(function (sc) {
+      var qs = quotes.filter(function (q) { return q.sceneId === sc.id; });
+      return '<div class="pm-tblock" data-scene="' + esc(sc.id) + '">' +
+        "<h4>" + esc(sc.order + ". " + sc.title) + "</h4>" +
+        '<div class="pm-aq-meta">' + esc(STAGE_LABEL[sc.arcStage] || sc.arcStage) +
+          " &middot; p" + esc(sc.pdfPageStart) + "&ndash;" + esc(sc.pdfPageEnd) + "</div>" +
+        "<p>" + esc(sc.summary) + "</p>" +
+        qs.map(function (q) {
+          return "<blockquote>&ldquo;" + esc(q.quote) + "&rdquo;" +
+            '<div class="pm-aq-meta">' + esc(q.theme || "") +
+            (q.pdfPage != null ? " &middot; p" + esc(q.pdfPage) : "") + "</div></blockquote>";
+        }).join("") +
+        "</div>";
+    }).join("");
+    textBuilt = true;
+  }
+
+  function syncTextToPct(p) {
+    var host = document.getElementById("pm-textreader");
+    if (!host || host.hidden) return;
+    var sc = sceneAtPct(p);
+    if (!sc) return;
+    var target = null;
+    host.querySelectorAll(".pm-tblock").forEach(function (b) {
+      var on = b.getAttribute("data-scene") === sc.id;
+      b.classList.toggle("pm-tblock-current", on);
+      if (on) target = b;
+    });
+    if (target && Date.now() - userScrolledAt > 4000) {
+      var top = target.getBoundingClientRect().top - host.getBoundingClientRect().top + host.scrollTop;
+      host.scrollTo({ top: Math.max(0, top - 6), behavior: "auto" });
+    }
+  }
+
+  function renderAllQuotes() {
+    var host = document.getElementById("pm-allquotes");
+    if (!host || allQuotesBuilt) return;
+    if (!quotes.length) { host.innerHTML = '<p class="pm-hint">Loading quotes…</p>'; return; }
+    var sorted = quotes.slice().sort(function (a, b) {
+      return (a.priority - b.priority) || ((a.pdfPage || 0) - (b.pdfPage || 0));
+    });
+    host.innerHTML = sorted.map(function (q) {
+      return '<div class="pm-aq pm-pri-' + esc(q.priority) + '">' +
+        "<blockquote>&ldquo;" + esc(q.quote) + "&rdquo;</blockquote>" +
+        '<div class="pm-aq-meta">' + esc(q.theme || "") +
+          (q.chapter != null ? " &middot; ch " + esc(q.chapter) : "") +
+          (q.pdfPage != null ? " &middot; p" + esc(q.pdfPage) : "") +
+          (q.sceneTitle ? " &middot; " + esc(q.sceneTitle) : "") + "</div>" +
+        (q.mnemonic ? '<div class="pm-qmnemonic">' + esc(q.mnemonic) + "</div>" : "") +
+        "</div>";
+    }).join("");
+    allQuotesBuilt = true;
+  }
+
   function render(container, audioEl, cfg) {
     root = container; audio = audioEl;
     placeholderUrl = null;
@@ -610,11 +725,11 @@
         }
       });
     }
+    injectReaderStyles();
     root.innerHTML =
       '<div class="pm-wrap">' +
         '<div class="pm-source">' +
-          '<div class="pm-source-row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
-            '<button class="pm-pick pm-pick-alt" id="pm-read" hidden>Read along (my PDF)</button>' +
+          '<div class="pm-source-row">' +
             '<button class="pm-pick pm-pick-alt" id="pm-setup-toggle" aria-expanded="false">Audio setup ▾</button>' +
           '</div>' +
           '<div class="pm-setup" id="pm-setup" hidden>' +
@@ -627,16 +742,33 @@
               'Load your own file — it stays on this device and is never uploaded.</div>' +
           '</div>' +
         "</div>" +
+        '<div class="pm-tabs" role="tablist">' +
+          '<button class="pm-tab pm-tab-active" data-tab="map">Plot map</button>' +
+          '<button class="pm-tab" data-tab="read">Read along</button>' +
+          '<button class="pm-tab" data-tab="quotes">Quotes</button>' +
+        '</div>' +
         '<div class="pm-status" id="pm-status"></div>' +
-        '<div class="pm-svgwrap" id="pm-svgwrap"></div>' +
-        '<div class="pm-detail" id="pm-detail"></div>' +
-        '<div class="pm-reader" id="pm-reader" hidden>' +
-          '<div class="pm-reader-head">' +
-            '<label class="pm-follow"><input type="checkbox" id="pm-follow" checked> Follow audio</label>' +
-            '<span class="pm-pagenum" id="pm-pagenum" style="font-weight:600;padding:2px 8px;border:1px solid currentColor;border-radius:6px"></span>' +
-            '<span class="pm-read-msg" id="pm-read-msg"></span>' +
+        '<div class="pm-panel" data-panel="map">' +
+          '<div class="pm-svgwrap" id="pm-svgwrap"></div>' +
+          '<div class="pm-detail" id="pm-detail"></div>' +
+        '</div>' +
+        '<div class="pm-panel" data-panel="read" hidden>' +
+          '<div class="pm-readmodes">' +
+            '<button class="pm-tab pm-tab-active" id="pm-mode-pdf" data-mode="pdf">PDF (my book)</button>' +
+            '<button class="pm-tab" id="pm-mode-text" data-mode="text">Text</button>' +
           '</div>' +
-          '<div class="pm-pages" id="pm-pages"></div>' +
+          '<div class="pm-reader" id="pm-reader">' +
+            '<div class="pm-reader-head">' +
+              '<label class="pm-follow"><input type="checkbox" id="pm-follow" checked> Follow audio</label>' +
+              '<span class="pm-pagenum" id="pm-pagenum"></span>' +
+              '<span class="pm-read-msg" id="pm-read-msg"></span>' +
+            '</div>' +
+            '<div class="pm-pages" id="pm-pages"></div>' +
+          '</div>' +
+          '<div class="pm-textreader" id="pm-textreader" hidden></div>' +
+        '</div>' +
+        '<div class="pm-panel" data-panel="quotes" hidden>' +
+          '<div class="pm-allquotes" id="pm-allquotes"></div>' +
         '</div>' +
       "</div>";
     svgWrap = document.getElementById("pm-svgwrap");
@@ -650,10 +782,14 @@
       var db = document.getElementById("pm-download");
       db.hidden = false;
       db.addEventListener("click", function () { downloadOffline(); });
-      var rb = document.getElementById("pm-read");
-      rb.hidden = false;
-      rb.addEventListener("click", function () { openReader(); });
     }
+    // Tab bar (Plot map / Read along / Quotes) + reading-mode toggle (PDF / Text).
+    root.querySelectorAll(".pm-tab[data-tab]").forEach(function (t) {
+      t.addEventListener("click", function () { showTab(t.getAttribute("data-tab")); });
+    });
+    var mpdf = document.getElementById("pm-mode-pdf"), mtext = document.getElementById("pm-mode-text");
+    if (mpdf) mpdf.addEventListener("click", function () { showReadMode("pdf"); });
+    if (mtext) mtext.addEventListener("click", function () { showReadMode("text"); });
     document.getElementById("pm-pick").addEventListener("click", function () {
       document.getElementById("pm-file").click();
     });
@@ -699,6 +835,8 @@
       quotes = res[1].quotes || [];
       svgWrap.innerHTML = buildSvg();
       renderDetail(null);
+      if (currentTab === "quotes") renderAllQuotes();
+      if (currentTab === "read" && readMode === "text") renderTextReader();
     }).catch(function (err) {
       svgWrap.innerHTML = '<p class="pm-err">Could not load the scene map. ' + esc(err && err.message) + "</p>";
     });
