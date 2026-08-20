@@ -28,7 +28,7 @@
   var pdfDoc = null, pdfPages = [], pdfNumPages = 0, readerOpen = false,
       followAudio = true, userScrolledAt = 0, lastSyncPage = 0;
   var currentTab = "map", readMode = "pdf", textBuilt = false, allQuotesBuilt = false;
-  var bookLoaded = false, bookParas = [], bookTotalWords = 0;
+  var bookLoaded = false, bookParas = [], bookTotalWords = 0, bookByPage = {};
 
   /* ---------- tiny IndexedDB store for the listener's own audio file ---------- */
   var DB = "pts-audio", STORE = "files";
@@ -631,7 +631,8 @@
       ".pm-bpara-current{background:rgba(74,158,255,.14)}" +
       ".pm-bprog{display:none}" +
       ".pm-bpara-current .pm-bprog{display:block;position:absolute;left:0;bottom:0;height:3px;" +
-        "background:var(--accent,#4a9eff);width:0;border-radius:2px}";
+        "background:var(--accent,#4a9eff);width:0;border-radius:2px}" +
+      ".pm-bookhead{position:sticky;top:0;z-index:2;padding:6px 0 8px;background:var(--bg,transparent)}";
     document.head.appendChild(s);
   }
 
@@ -653,6 +654,7 @@
       var pnl = document.getElementById(panels[m]); if (pnl) pnl.hidden = m !== mode;
       var btn = document.getElementById(buttons[m]); if (btn) btn.classList.toggle("pm-tab-active", m === mode);
     });
+    var bookhead = document.getElementById("pm-bookhead"); if (bookhead) bookhead.hidden = mode !== "book";
     var p = pctNow();
     if (mode === "pdf") openReader();
     else if (mode === "book") { openBookText(); if (p != null) syncBookToPct(p); }
@@ -690,8 +692,8 @@
   // is generated or stored by the app. Group text items into lines by vertical position,
   // then start a new paragraph on an indented line (how novels mark paragraphs).
   function extractParagraphs(doc) {
-    var paras = [], cur = "";
-    function flush() { var t = cur.trim(); if (t) paras.push(t); cur = ""; }
+    var paras = [], cur = "", curPage = 1;
+    function flush() { var t = cur.trim(); if (t) paras.push({ text: t, page: curPage }); cur = ""; }
     var chain = Promise.resolve();
     for (var n = 1; n <= doc.numPages; n++) {
       (function (pageNum) {
@@ -712,8 +714,8 @@
               lines.forEach(function (ln) {
                 var text = ln.text.replace(/\s+/g, " ").trim();
                 if (!text || /^\d{1,4}$/.test(text)) return; // drop bare page numbers
-                if (ln.x > leftMargin + 8) { flush(); cur = text; }   // indent => new paragraph
-                else { cur += (cur ? " " : "") + text; }
+                if (ln.x > leftMargin + 8) { flush(); cur = text; curPage = pageNum; } // indent => new paragraph
+                else { if (!cur) curPage = pageNum; cur += (cur ? " " : "") + text; }
               });
             });
           });
@@ -725,37 +727,58 @@
 
   function renderBookParas(host, paras) {
     host.addEventListener("scroll", function () { userScrolledAt = Date.now(); });
-    bookParas = []; bookTotalWords = 0;
+    bookParas = []; bookByPage = {}; bookTotalWords = 0;
     var html = "";
     paras.forEach(function (para, i) {
-      var wc = para.split(/\s+/).filter(Boolean).length;
-      bookParas.push({ start: bookTotalWords, words: wc });
+      var wc = para.text.split(/\s+/).filter(Boolean).length;
+      bookParas.push({ idx: i, page: para.page, words: wc });
       bookTotalWords += wc;
-      html += '<p class="pm-bpara" data-idx="' + i + '">' + esc(para) + '<span class="pm-bprog"></span></p>';
-    });
-    bookParas.forEach(function (bp) {
-      bp.pctStart = bookTotalWords ? (bp.start / bookTotalWords) * 100 : 0;
-      bp.pctEnd = bookTotalWords ? ((bp.start + bp.words) / bookTotalWords) * 100 : 100;
+      (bookByPage[para.page] = bookByPage[para.page] || []).push(i);
+      html += '<p class="pm-bpara" data-idx="' + i + '" data-page="' + para.page + '">' +
+        esc(para.text) + '<span class="pm-bprog"></span></p>';
     });
     host.innerHTML = html;
+  }
+
+  // Fractional PDF page for a position, from the scene anchors (same map the PDF reader
+  // uses). This is the only per-position timing we have; it keeps the highlight within a
+  // page instead of drifting, and it skips the un-narrated front matter automatically.
+  function pageForPctFloat(p) {
+    var sc = sceneAtPct(p);
+    if (sc && sc.pdfPageStart) {
+      var span = (sc.endPct - sc.startPct) || 1;
+      var frac = Math.max(0, Math.min(1, (p - sc.startPct) / span));
+      var pEnd = sc.pdfPageEnd || sc.pdfPageStart;
+      return sc.pdfPageStart + frac * (pEnd - sc.pdfPageStart);
+    }
+    return Math.max(1, Math.min(pdfNumPages, (p / 100) * pdfNumPages));
   }
 
   function syncBookToPct(p) {
     var host = document.getElementById("pm-bookreader");
     if (!host || host.hidden || !bookParas.length) return;
-    var idx = -1;
-    for (var i = 0; i < bookParas.length; i++) {
-      if (p >= bookParas[i].pctStart && p < bookParas[i].pctEnd) { idx = i; break; }
+    var fpage = pageForPctFloat(p);
+    var page = Math.max(1, Math.floor(fpage));
+    var within = Math.max(0, Math.min(0.999, fpage - page));
+    // Pick the paragraph: those starting on this page, indexed by position through the page;
+    // if none start here (a paragraph spans it), fall back to the last one before it.
+    var idx;
+    var onPage = bookByPage[page];
+    if (onPage && onPage.length) {
+      idx = onPage[Math.floor(within * onPage.length)];
+    } else {
+      idx = bookParas[0].idx;
+      for (var i = 0; i < bookParas.length; i++) { if (bookParas[i].page <= page) idx = bookParas[i].idx; else break; }
     }
-    if (idx < 0) idx = p <= 0 ? 0 : bookParas.length - 1;
     var paras = host.querySelectorAll(".pm-bpara");
-    paras.forEach(function (el, i) { el.classList.toggle("pm-bpara-current", i === idx); });
+    paras.forEach(function (el) { el.classList.remove("pm-bpara-current"); var pr = el.querySelector(".pm-bprog"); if (pr) pr.style.width = "0"; });
     var cur = paras[idx];
     if (!cur) return;
-    var bp = bookParas[idx];
-    var frac = (bp.pctEnd - bp.pctStart) ? (p - bp.pctStart) / (bp.pctEnd - bp.pctStart) : 0;
+    cur.classList.add("pm-bpara-current");
     var prog = cur.querySelector(".pm-bprog");
-    if (prog) prog.style.width = Math.max(0, Math.min(100, frac * 100)) + "%";
+    if (prog) prog.style.width = Math.round(within * 100) + "%";
+    var box = document.getElementById("pm-bookpage");
+    if (box) box.textContent = "Page " + page + " of " + pdfNumPages;
     if (Date.now() - userScrolledAt > 4000) {
       var top = cur.getBoundingClientRect().top - host.getBoundingClientRect().top + host.scrollTop;
       host.scrollTo({ top: Math.max(0, top - 40), behavior: "auto" });
@@ -879,6 +902,7 @@
             '<div class="pm-pages" id="pm-pages"></div>' +
           '</div>' +
           '<div class="pm-textreader" id="pm-textreader" hidden></div>' +
+          '<div class="pm-bookhead" id="pm-bookhead" hidden><span class="pm-pagenum" id="pm-bookpage"></span></div>' +
           '<div class="pm-bookreader" id="pm-bookreader" hidden></div>' +
         '</div>' +
         '<div class="pm-panel" data-panel="quotes" hidden>' +
