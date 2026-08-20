@@ -28,6 +28,7 @@
   var pdfDoc = null, pdfPages = [], pdfNumPages = 0, readerOpen = false,
       followAudio = true, userScrolledAt = 0, lastSyncPage = 0;
   var currentTab = "map", readMode = "pdf", textBuilt = false, allQuotesBuilt = false;
+  var bookLoaded = false, bookParas = [], bookTotalWords = 0;
 
   /* ---------- tiny IndexedDB store for the listener's own audio file ---------- */
   var DB = "pts-audio", STORE = "files";
@@ -233,7 +234,8 @@
       statusEl.textContent = sc ? "Now: " + sc.order + ". " + sc.title + "  (" + p.toFixed(1) + "% through)" : "";
     }
     if (currentTab === "read") {
-      if (readMode === "text") syncTextToPct(p);
+      if (readMode === "book") syncBookToPct(p);
+      else if (readMode === "text") syncTextToPct(p);
       else if (readerOpen) syncReaderToPct(p, false);
     }
   }
@@ -623,7 +625,13 @@
       ".pm-tblock blockquote{margin:8px 0 0;padding-left:10px;border-left:3px solid var(--accent,#4a9eff)}" +
       ".pm-aq{padding:12px 14px;margin:0 0 10px;border-radius:12px;background:var(--bg-card)}" +
       ".pm-aq blockquote{margin:0 0 6px}" +
-      ".pm-aq-meta{font-size:.85rem;opacity:.7}";
+      ".pm-aq-meta{font-size:.85rem;opacity:.7}" +
+      ".pm-bookreader{max-height:74vh;overflow-y:auto;line-height:1.75;font-size:1.05rem;padding:0 4px}" +
+      ".pm-bpara{position:relative;margin:0 0 1em;padding:4px 8px;border-radius:6px;transition:background .15s}" +
+      ".pm-bpara-current{background:rgba(74,158,255,.14)}" +
+      ".pm-bprog{display:none}" +
+      ".pm-bpara-current .pm-bprog{display:block;position:absolute;left:0;bottom:0;height:3px;" +
+        "background:var(--accent,#4a9eff);width:0;border-radius:2px}";
     document.head.appendChild(s);
   }
 
@@ -639,15 +647,93 @@
 
   function showReadMode(mode) {
     readMode = mode;
-    var pdfPanel = document.getElementById("pm-reader");
-    var textPanel = document.getElementById("pm-textreader");
-    var mpdf = document.getElementById("pm-mode-pdf"), mtext = document.getElementById("pm-mode-text");
-    if (mpdf) mpdf.classList.toggle("pm-tab-active", mode === "pdf");
-    if (mtext) mtext.classList.toggle("pm-tab-active", mode === "text");
-    if (pdfPanel) pdfPanel.hidden = mode !== "pdf";
-    if (textPanel) textPanel.hidden = mode !== "text";
+    var panels = { pdf: "pm-reader", book: "pm-bookreader", text: "pm-textreader" };
+    var buttons = { pdf: "pm-mode-pdf", book: "pm-mode-book", text: "pm-mode-text" };
+    Object.keys(panels).forEach(function (m) {
+      var pnl = document.getElementById(panels[m]); if (pnl) pnl.hidden = m !== mode;
+      var btn = document.getElementById(buttons[m]); if (btn) btn.classList.toggle("pm-tab-active", m === mode);
+    });
+    var p = pctNow();
     if (mode === "pdf") openReader();
-    else { renderTextReader(); var p = pctNow(); if (p != null) syncTextToPct(p); }
+    else if (mode === "book") { openBookText(); if (p != null) syncBookToPct(p); }
+    else { renderTextReader(); if (p != null) syncTextToPct(p); }
+  }
+
+  // Book text mode: a verbatim reader of a text file the user supplies from their OWN
+  // copy of the novel (never produced by the app). Reads book.md from the same private,
+  // sign-in-gated bucket; highlights and slides through the current paragraph as the
+  // audio plays, mapping position by word-fraction the same way the plot arc uses pct.
+  function bookUrl(token) {
+    var key = (priv.key || "").replace(/\.[^.]+$/, ".md");
+    return priv.worker.replace(/\/+$/, "") + "/" + key.replace(/^\/+/, "") + "?t=" + encodeURIComponent(token);
+  }
+
+  function openBookText() {
+    if (bookLoaded) return;
+    var host = document.getElementById("pm-bookreader");
+    if (!host) return;
+    var tok = storedToken();
+    if (!tok) { host.innerHTML = '<p class="pm-hint">Sign in (Audio setup) to load your book text.</p>'; return; }
+    host.innerHTML = '<p class="pm-hint">Loading your book text…</p>';
+    fetch(bookUrl(tok)).then(function (r) {
+      if (r.status === 404) throw new Error("nofile");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    }).then(function (txt) {
+      renderBookText(host, txt);
+      bookLoaded = true;
+      var p = pctNow(); if (p != null) syncBookToPct(p);
+    }).catch(function (e) {
+      if (e && e.message === "nofile") {
+        host.innerHTML = '<div class="pm-hint" style="line-height:1.6">' +
+          '<strong>Book text not added yet.</strong><br>' +
+          'This view reads a verbatim text file of the novel from your own copy. Add a ' +
+          '<code>book.md</code> (plain paragraphs separated by blank lines) to your private ' +
+          'bucket and it appears here, with a highlight that tracks the audio paragraph by paragraph.</div>';
+      } else {
+        host.innerHTML = '<p class="pm-err">Could not load book text: ' + esc(e && e.message) + "</p>";
+      }
+    });
+  }
+
+  function renderBookText(host, txt) {
+    host.addEventListener("scroll", function () { userScrolledAt = Date.now(); });
+    var paras = txt.replace(/\r/g, "").split(/\n\s*\n/).map(function (s) { return s.trim(); }).filter(Boolean);
+    bookParas = []; bookTotalWords = 0;
+    var html = "";
+    paras.forEach(function (para, i) {
+      var wc = para.split(/\s+/).filter(Boolean).length;
+      bookParas.push({ start: bookTotalWords, words: wc });
+      bookTotalWords += wc;
+      html += '<p class="pm-bpara" data-idx="' + i + '">' + esc(para) + '<span class="pm-bprog"></span></p>';
+    });
+    bookParas.forEach(function (bp) {
+      bp.pctStart = bookTotalWords ? (bp.start / bookTotalWords) * 100 : 0;
+      bp.pctEnd = bookTotalWords ? ((bp.start + bp.words) / bookTotalWords) * 100 : 100;
+    });
+    host.innerHTML = html;
+  }
+
+  function syncBookToPct(p) {
+    var host = document.getElementById("pm-bookreader");
+    if (!host || host.hidden || !bookParas.length) return;
+    var idx = -1;
+    for (var i = 0; i < bookParas.length; i++) {
+      if (p >= bookParas[i].pctStart && p < bookParas[i].pctEnd) { idx = i; break; }
+    }
+    if (idx < 0) idx = p <= 0 ? 0 : bookParas.length - 1;
+    var paras = host.querySelectorAll(".pm-bpara");
+    paras.forEach(function (el, i) { el.classList.toggle("pm-bpara-current", i === idx); });
+    var cur = paras[idx];
+    if (!cur) return;
+    var bp = bookParas[idx];
+    var frac = (bp.pctEnd - bp.pctStart) ? (p - bp.pctStart) / (bp.pctEnd - bp.pctStart) : 0;
+    var prog = cur.querySelector(".pm-bprog");
+    if (prog) prog.style.width = Math.max(0, Math.min(100, frac * 100)) + "%";
+    if (Date.now() - userScrolledAt > 4000) {
+      var top = cur.getBoundingClientRect().top - host.getBoundingClientRect().top + host.scrollTop;
+      host.scrollTo({ top: Math.max(0, top - 40), behavior: "auto" });
+    }
   }
 
   // Text mode: a reflowable, scrolling companion built from the app's OWN scene
@@ -754,8 +840,9 @@
         '</div>' +
         '<div class="pm-panel" data-panel="read" hidden>' +
           '<div class="pm-readmodes">' +
-            '<button class="pm-tab pm-tab-active" id="pm-mode-pdf" data-mode="pdf">PDF (my book)</button>' +
-            '<button class="pm-tab" id="pm-mode-text" data-mode="text">Text</button>' +
+            '<button class="pm-tab pm-tab-active" id="pm-mode-pdf" data-mode="pdf">PDF</button>' +
+            '<button class="pm-tab" id="pm-mode-book" data-mode="book">Book text</button>' +
+            '<button class="pm-tab" id="pm-mode-text" data-mode="text">Summary</button>' +
           '</div>' +
           '<div class="pm-reader" id="pm-reader">' +
             '<div class="pm-reader-head">' +
@@ -766,6 +853,7 @@
             '<div class="pm-pages" id="pm-pages"></div>' +
           '</div>' +
           '<div class="pm-textreader" id="pm-textreader" hidden></div>' +
+          '<div class="pm-bookreader" id="pm-bookreader" hidden></div>' +
         '</div>' +
         '<div class="pm-panel" data-panel="quotes" hidden>' +
           '<div class="pm-allquotes" id="pm-allquotes"></div>' +
@@ -787,8 +875,10 @@
     root.querySelectorAll(".pm-tab[data-tab]").forEach(function (t) {
       t.addEventListener("click", function () { showTab(t.getAttribute("data-tab")); });
     });
-    var mpdf = document.getElementById("pm-mode-pdf"), mtext = document.getElementById("pm-mode-text");
+    var mpdf = document.getElementById("pm-mode-pdf"), mtext = document.getElementById("pm-mode-text"),
+        mbook = document.getElementById("pm-mode-book");
     if (mpdf) mpdf.addEventListener("click", function () { showReadMode("pdf"); });
+    if (mbook) mbook.addEventListener("click", function () { showReadMode("book"); });
     if (mtext) mtext.addEventListener("click", function () { showReadMode("text"); });
     document.getElementById("pm-pick").addEventListener("click", function () {
       document.getElementById("pm-file").click();
