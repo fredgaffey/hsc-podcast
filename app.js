@@ -13,7 +13,7 @@
   const VOICE_LOG_KEY = "podcast-voice-log";          // { voiceName: content-seconds actually played }
   const LAST_SUBJECT_KEY = "podcast-last-subject";    // remember which subject was last open
   const SIMPLE_SPEED_KEY = "podcast-simple-speed";    // "1" = simple dropdown speed picker (screen-off/low-speed mode)
-  const HS_ENGINE_KEY = "podcast-hs-engine";          // "1" = user wants the Web Audio high-speed engine (when NOT in simple mode)
+  const HS_ENGINE_KEY = "podcast-speechwarp";         // "0" = user opted out of the speechwarp engine in high-speed mode (default on)
   const PLAYER_MIN_KEY = "podcast-player-min";        // "1" = now-playing bar minimised to save space
   const SUBJECTS_KEY = "podcast-subjects";            // JSON array of chosen subject ids (onboarding); absent = show all
   const ONBOARDED_KEY = "podcast-onboarded";          // "1" once the first-run subject picker has been completed/skipped
@@ -61,12 +61,11 @@
 
   // --- DOM refs ---
   const audioEl = document.getElementById("audio");
-  // Hybrid audio (see speed-engine.js). DEFAULT backend: the native <audio> element with
-  // preservesPitch — the same clean, pitch-preserved high speed the browser speed
-  // extensions use, audible to 16x and able to play with the screen off. FALLBACK (opt-in
-  // Settings toggle): the Web Audio WSOLA time-stretch engine, for devices that mute
-  // native playbackRate at high speed; audible to 16x on any device but no background
-  // playback. In engine mode a silent looping element anchors the iOS media session so
+  // Hybrid audio (see speed-engine.js). DEFAULT backend in high-speed mode: the speechwarp
+  // engine (nonlinear Speedy/Sonic speed-up in an AudioWorklet), audible and followable to
+  // 16x on any device but no background playback. FALLBACK: the native <audio> element with
+  // preservesPitch — used in screen-off mode, for long-form audio, and when the Settings
+  // toggle is off. In engine mode a silent looping element anchors the iOS media session so
   // lock-screen / headphone controls still work. See createHybridAudio.
   const audio = window.createHybridAudio ? window.createHybridAudio(audioEl) : audioEl;
 
@@ -442,11 +441,13 @@
   // High-speed mode uses the Web Audio engine so it stays audible past ~4× (where
   // browsers mute native playbackRate). So: effective engine = high-speed mode AND the
   // user wants it AND the device supports it.
-  function wantsHsEngine() { return localStorage.getItem(HS_ENGINE_KEY) === "1"; }
-  // Engine retired (Fred, 2026-07-08): native <audio>+preservesPitch does high speed AND streams
-  // AND plays in the background AND sounds better. The Web Audio engine adds nothing and breaks
-  // streaming (BUG-15) + lock-screen resume (BUG-10) + clarity (BUG-28). Always use native.
-  function effectiveEngine() { return false; }
+  function wantsHsEngine() { return localStorage.getItem(HS_ENGINE_KEY) !== "0"; }
+  // The old WSOLA engine was retired on 2026-07-08 for clarity (BUG-28); speechwarp replaces
+  // it as the high-speed default. Screen-off mode stays native — it's the only backend that
+  // plays in the background.
+  function effectiveEngine() {
+    return !simpleSpeedMode() && wantsHsEngine() && !!audio.engineAvailable;
+  }
   function syncEngine(reload) {
     if (!audio.setEngineEnabled) return;
     const target = effectiveEngine();
@@ -470,21 +471,16 @@
 
   initSpeed();
   // One-time migration: screen-off mode is the default, but existing high-speed users
-  // (Web Audio engine on, or a saved speed above the 2× cap) keep high-speed mode so we
-  // don't silently slow them down. Must run before applySpeedUI()/syncEngine() read it.
+  // (a saved speed above the 2× cap) keep high-speed mode so we don't silently slow them
+  // down. Must run before applySpeedUI()/syncEngine() read it.
   if (localStorage.getItem(SIMPLE_SPEED_KEY) === null) {
     const storedIdx = parseInt(localStorage.getItem(SPEED_KEY), 10);
     const storedSpeed = isNaN(storedIdx) ? 1 : (SPEED_OPTIONS[storedIdx] || 1);
-    if (audio.engineEnabled === true || storedSpeed > 2) {
+    if (storedSpeed > 2) {
       try { localStorage.setItem(SIMPLE_SPEED_KEY, "0"); } catch (e) {}
     }
   }
   applySpeedUI();
-  // Seed the high-speed-engine intent from whatever backend is currently active (the old
-  // standalone engine toggle), then reconcile the active backend with the mode.
-  if (localStorage.getItem(HS_ENGINE_KEY) === null) {
-    try { localStorage.setItem(HS_ENGINE_KEY, audio.engineEnabled ? "1" : "0"); } catch (e) {}
-  }
   syncEngine(false);
 
   // --- Theme ---
@@ -1849,11 +1845,14 @@
     if (introTitleToggle) introTitleToggle.checked = introEnabled();
     if (quizSplitToggle) quizSplitToggle.checked = quizSplitBySubject();
     if (speedEngineToggle) {
-      // Engine retired — always native. Hide the toggle + its hint (see effectiveEngine).
-      const row = speedEngineToggle.closest(".setting-row");
-      const hint = row && row.nextElementSibling;
-      if (row) setHidden(row, true);
-      if (hint && hint.classList.contains("setting-hint")) setHidden(hint, true);
+      speedEngineToggle.checked = wantsHsEngine();
+      // No AudioWorklet → nothing to toggle. Hide the toggle + its hint.
+      if (!audio.engineAvailable) {
+        const row = speedEngineToggle.closest(".setting-row");
+        const hint = row && row.nextElementSibling;
+        if (row) setHidden(row, true);
+        if (hint && hint.classList.contains("setting-hint")) setHidden(hint, true);
+      }
     }
     if (fsrsRetentionSelect) fsrsRetentionSelect.value = String(fsrsSettings().retention);
     if (fsrsStepsInput) fsrsStepsInput.value = fsrsSettings().steps;
@@ -1872,7 +1871,7 @@
   if (simpleSpeedToggle) simpleSpeedToggle.addEventListener("change", () => {
     localStorage.setItem(SIMPLE_SPEED_KEY, simpleSpeedToggle.checked ? "1" : "0");
     applySpeedUI();
-    syncEngine(true); // simple mode ⇒ native (background); high-speed mode ⇒ Web Audio engine
+    syncEngine(true); // simple mode ⇒ native (background); high-speed mode ⇒ speechwarp
   });
   const btnChooseSubjects = document.getElementById("btn-choose-subjects");
   if (btnChooseSubjects) btnChooseSubjects.addEventListener("click", () => {

@@ -9,10 +9,12 @@
 //   engine: it speeds audio up WITHOUT raising pitch and stays audible all the
 //   way to 16x, on any of the existing voice files (no re-rendering).
 //
-//   Algorithm: WSOLA (Waveform Similarity Overlap-Add) running in an
-//   AudioWorklet — the same family of TSM every podcast app uses for its speed
-//   button. The whole episode is decoded once into memory and the worklet pulls
-//   from it at the requested tempo, so the TTS is never re-run per speed.
+//   Algorithm: speechwarp (vendor/speechwarp) — Google's Speedy nonlinear
+//   speed-up on top of Sonic, compiled to WebAssembly and run in an AudioWorklet.
+//   Nonlinear means vowels and pauses are compressed harder than consonants, the
+//   way a fast talker speeds up, so high speeds stay followable. The whole episode
+//   is decoded once into memory and the worklet pulls from it at the requested
+//   speed, so the TTS is never re-run per speed.
 //
 // Integration:
 //   `createHybridAudio(el)` returns an object that quacks like the subset of the
@@ -33,134 +35,10 @@
   // and a lower rate halves the decoded-PCM memory footprint for long episodes.
   const TARGET_RATE = 24000;
 
-  // The WSOLA time-stretcher, as an AudioWorklet processor. Defined as a string
-  // and loaded from a Blob URL so there's no extra file to register/cache and it
-  // stays offline-friendly. `sampleRate` is a global inside the worklet scope.
-  const WORKLET_SRC = `
-class StretchProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.x = new Float32Array(0); // mono source samples
-    this.srcLen = 0;
-    this.tempo = 1;               // playback speed (output is this much faster)
-    this.playing = false;
-    this.ended = false;
-
-    // Frame geometry. Synthesis hop is fixed at 50% overlap so Hann windows
-    // reconstruct to unity gain; analysis hop scales with tempo.
-    this.N = Math.round(sampleRate * 0.045) & ~1; // ~45 ms, even
-    this.Hs = this.N >> 1;                          // synthesis hop (50%)
-    this.tol = Math.round(sampleRate * 0.010);      // ±10 ms similarity search
-    this.win = new Float32Array(this.N);
-    for (let i = 0; i < this.N; i++) {
-      this.win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (this.N - 1));
-    }
-
-    this.analysisPos = 0;  // source index (float) of the next analysis frame
-    this.naturalNext = 0;  // source index of the ideal continuation (for WSOLA search)
-    this.acc = new Float32Array(this.N); // overlap-add accumulator
-    this.fifo = new Float32Array(this.N * 4); // output ring buffer
-    this.fifoHead = 0; this.fifoTail = 0; this.fifoCount = 0;
-    this.reportCtr = 0;
-
-    this.port.onmessage = (e) => this.onMsg(e.data);
-  }
-
-  onMsg(m) {
-    switch (m.type) {
-      case "load":
-        this.x = new Float32Array(m.buffer); // transferred ArrayBuffer
-        this.srcLen = this.x.length;
-        this.reset(0);
-        break;
-      case "tempo": this.tempo = Math.max(0.25, Math.min(16, m.value)); break;
-      case "play":  if (!this.ended) this.playing = true; break;
-      case "pause": this.playing = false; break;
-      case "seek":  this.reset(Math.max(0, Math.min(this.srcLen - 1, Math.round(m.t * sampleRate)))); break;
-    }
-  }
-
-  reset(pos) {
-    this.analysisPos = pos;
-    this.naturalNext = pos;
-    this.acc.fill(0);
-    this.fifoHead = this.fifoTail = this.fifoCount = 0;
-    this.ended = false;
-  }
-
-  pushFifo(v) {
-    if (this.fifoCount >= this.fifo.length) return; // ring full; drop (shouldn't happen)
-    this.fifo[this.fifoTail] = v;
-    this.fifoTail = (this.fifoTail + 1) % this.fifo.length;
-    this.fifoCount++;
-  }
-  popFifo() {
-    const v = this.fifo[this.fifoHead];
-    this.fifoHead = (this.fifoHead + 1) % this.fifo.length;
-    this.fifoCount--;
-    return v;
-  }
-
-  // Produce one synthesis hop (Hs samples) of stretched audio into the FIFO.
-  synthStep() {
-    const { N, Hs, tol, win, x, srcLen } = this;
-    if (this.analysisPos + N >= srcLen) { this.ended = true; this.playing = false; return; }
-
-    // WSOLA: search ±tol around the analysis position for the frame whose
-    // overlap region best matches the natural continuation of the last grain,
-    // so periodic (voiced) structure stays aligned and phase jumps are avoided.
-    let best = 0;
-    const base = Math.round(this.analysisPos);
-    if (this.analysisPos > 0 && this.naturalNext + (N - Hs) < srcLen) {
-      let bestScore = -Infinity;
-      for (let d = -tol; d <= tol; d++) {
-        const p = base + d;
-        if (p < 0 || p + N >= srcLen) continue;
-        let score = 0;
-        for (let i = 0; i < N - Hs; i += 2) score += x[p + i] * x[this.naturalNext + i];
-        if (score > bestScore) { bestScore = score; best = d; }
-      }
-    }
-    let start = base + best;
-    if (start < 0) start = 0;
-    if (start + N >= srcLen) start = srcLen - N - 1;
-
-    // Window the chosen grain and overlap-add it into the accumulator.
-    for (let i = 0; i < N; i++) this.acc[i] += win[i] * x[start + i];
-    // The first Hs samples are now finished — emit them.
-    for (let i = 0; i < Hs; i++) this.pushFifo(this.acc[i]);
-    // Slide the accumulator left by Hs for the next grain's overlap.
-    this.acc.copyWithin(0, Hs, N);
-    this.acc.fill(0, N - Hs, N);
-
-    this.naturalNext = start + Hs;
-    this.analysisPos += Hs * this.tempo; // analysis hop = synthesis hop × speed
-  }
-
-  process(_inputs, outputs) {
-    const out = outputs[0][0];
-    if (!out) return true;
-
-    if (!this.playing || this.srcLen === 0) { out.fill(0); return true; }
-
-    for (let i = 0; i < out.length; i++) {
-      while (this.fifoCount === 0 && !this.ended) this.synthStep();
-      out[i] = this.fifoCount > 0 ? this.popFifo() : 0;
-    }
-
-    // Report playback position (~30 fps) and end-of-stream back to the main thread.
-    if ((this.reportCtr++ & 7) === 0) {
-      this.port.postMessage({ type: "pos", t: this.analysisPos / sampleRate });
-    }
-    if (this.ended && this.fifoCount === 0) {
-      this.ended = false; // one-shot
-      this.port.postMessage({ type: "ended" });
-    }
-    return true;
-  }
-}
-registerProcessor("stretch-processor", StretchProcessor);
-`;
+  // The time-stretcher is speechwarp (Speedy + Sonic in WebAssembly), vendored by
+  // `npm run vendor:speechwarp`. Its ready-made AudioWorklet processor imports ./index.js,
+  // so the three files stay together in vendor/speechwarp/.
+  const PROCESSOR_URL = "vendor/speechwarp/speechwarp-processor.js";
 
   // Use `in` — do NOT read `AudioContext.prototype.audioWorklet`. It's a getter that
   // requires a real context as `this`; touching it on the prototype throws "Illegal
@@ -208,8 +86,7 @@ registerProcessor("stretch-processor", StretchProcessor);
       window.addEventListener("focus", resumeIfWanted);
       window.addEventListener("orientationchange", resumeIfWanted);
       window.addEventListener("pageshow", resumeIfWanted);
-      const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
-      return ctx.audioWorklet.addModule(url).then(() => URL.revokeObjectURL(url));
+      return ctx.audioWorklet.addModule(new URL(PROCESSOR_URL, document.baseURI).href);
     }
 
     function load() {
@@ -226,7 +103,7 @@ registerProcessor("stretch-processor", StretchProcessor);
         .then((audioBuf) => {
           if (token !== loadToken) return; // a newer src superseded this load
 
-          // Downmix to mono (speech) — halves memory and simplifies the worklet.
+          // Downmix to mono (speech) — halves memory and the work per frame.
           const ch = audioBuf.numberOfChannels;
           const len = audioBuf.length;
           const mono = new Float32Array(len);
@@ -236,15 +113,22 @@ registerProcessor("stretch-processor", StretchProcessor);
           }
 
           if (node) { try { node.disconnect(); } catch (e) {} }
-          node = new AudioWorkletNode(ctx, "stretch-processor", { outputChannelCount: [1] });
+          node = new AudioWorkletNode(ctx, "speechwarp-processor", {
+            outputChannelCount: [1],
+            processorOptions: { speed: _rate },
+          });
+          // The processor reports { frame, ended } ~6x a second whether or not it is
+          // playing, and keeps reporting ended: true once done. Only surface it while
+          // playing, and fire `ended` once.
           node.port.onmessage = (e) => {
             const m = e.data;
-            if (m.type === "pos") { _currentTime = m.t; fire("timeupdate"); }
-            else if (m.type === "ended") { _paused = true; _currentTime = _duration; fire("ended"); }
+            if (m.type !== "position" || _paused) return;
+            if (m.ended) { _paused = true; _currentTime = _duration; fire("ended"); return; }
+            _currentTime = m.frame / ctx.sampleRate;
+            fire("timeupdate");
           };
           node.connect(ctx.destination);
-          node.port.postMessage({ type: "tempo", value: _rate });
-          node.port.postMessage({ type: "load", buffer: mono.buffer }, [mono.buffer]);
+          node.port.postMessage({ type: "load", channels: [mono] }, [mono.buffer]);
 
           _duration = len / audioBuf.sampleRate;
           _ready = true;
@@ -277,13 +161,13 @@ registerProcessor("stretch-processor", StretchProcessor);
       get currentTime() { return _currentTime; },
       set currentTime(t) {
         _currentTime = t;
-        if (node) node.port.postMessage({ type: "seek", t });
+        if (node) node.port.postMessage({ type: "seek", frame: Math.round(t * ctx.sampleRate) });
         fire("timeupdate");
       },
       get playbackRate() { return _rate; },
       set playbackRate(r) {
         _rate = Math.max(0.25, Math.min(16, r));
-        if (node) node.port.postMessage({ type: "tempo", value: _rate });
+        if (node) node.port.postMessage({ type: "speed", value: _rate });
       },
       get src() { return srcUrl; },
       set src(v) { srcUrl = v; },
@@ -333,13 +217,10 @@ registerProcessor("stretch-processor", StretchProcessor);
     const EVENTS = ["loadedmetadata", "play", "pause", "ended", "timeupdate"];
 
     let engineActive = false;              // is the TSM engine the audible backend right now?
-    // Default is the NATIVE element with preservesPitch (see setNativePitch) — the same
-    // clean, pitch-preserved high-speed the browser speed extensions use, and it plays in
-    // the background. The WSOLA engine is now the opt-in FALLBACK ("0"=native default;
-    // "1"=force engine), for the edge case where a device mutes native playbackRate at
-    // high speed. Flipped from engine-default: the engine's high-speed twang was the
-    // complaint, and native preservesPitch was never actually tried.
-    let enginePref = !!eng && localStorage.getItem(PREF_KEY) === "1";
+    // Default is the speechwarp engine wherever AudioWorklet exists ("0" = native). The
+    // native element with preservesPitch stays as the fallback: it is what plays with the
+    // screen off, and app.js forces it for screen-off mode and long-form audio.
+    let enginePref = !!eng && localStorage.getItem(PREF_KEY) !== "0";
     let _src = "";
     let _rate = 1;
     let anchoring = false;                 // is the silent-loop anchor currently running on el?
