@@ -9,7 +9,7 @@
 #   ./deploy.sh                                   # deploy to $PAGES_PROJECT (default below)
 #   PAGES_PROJECT=hsc-podcast-unified ./deploy.sh
 #
-# Prereqs: wrangler (logged in), rsync, git.
+# Prereqs: wrangler (logged in), rsync, git, npm (for the speechwarp dependency).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
@@ -35,6 +35,12 @@ python3 -c 'import json,sys; json.dump({"build":sys.argv[1],"message":sys.argv[2
 cp manifest.json "$DIST/"
 cp -r vendor "$DIST/"
 cp -r icons "$DIST/"
+# speechwarp (the speed engine) is an npm dependency, not checked in: ship its built files
+# from node_modules. speed-engine.js loads vendor/speechwarp/speechwarp-processor.js.
+[ -d node_modules/speechwarp ] || npm install
+mkdir -p "$DIST/vendor/speechwarp"
+cp node_modules/speechwarp/dist/*.js node_modules/speechwarp/licenses/LICENSE \
+  node_modules/speechwarp/licenses/NOTICE "$DIST/vendor/speechwarp/"
 
 # Per-episode text the app fetches at runtime (script/supplementary/quiz only). Skip
 # underscore dirs (the _template-subject scaffold) and never ship audio or voices.json.
